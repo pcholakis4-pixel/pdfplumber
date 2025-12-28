@@ -1,0 +1,225 @@
+# find_or_regenerate_crosswalk.py
+# Finds existing crosswalk.xlsx (or .csv) in cwd; if missing, regenerates using
+# available PDF reader and pure-Python fuzzy matching.
+# Works in restricted envs (no pdfplumber/rapidfuzz). Requires pandas; if
+# openpyxl unavailable will write CSV fallback.
+
+import sys, re
+from pathlib import Path
+from difflib import SequenceMatcher
+
+try:
+    import pandas as pd
+except Exception as e:
+    raise SystemExit("pandas is required to run this script: " + str(e))
+
+# --- Config / discovered files ---
+CWD = Path(".").resolve()
+OUTPUT_NAME = "crosswalk.xlsx"
+OUTPUT_PATH = CWD / OUTPUT_NAME
+
+OMNI_GLOB = list(CWD.glob("OmniClass Table*.csv"))
+UNIFORMAT_PDF = CWD / "UniFormat2010.pdf"
+MASTERFORMAT_PDF = CWD / "masterformat-2016.pdf"
+
+# --- Helpers ---
+def find_existing_outputs():
+    candidates = list(CWD.glob("crosswalk*.xlsx")) + list(CWD.glob("crosswalk*.xls")) + list(CWD.glob("crosswalk*.csv"))
+    return candidates
+
+def clean_text(s):
+    if s is None: return ""
+    s = str(s)
+    s = re.sub(r'[\u2190-\u21FF]', '-', s)
+    s = re.sub(r'[^\x00-\x7F]+', ' ', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+# Minimal token_sort_ratio implementation (similar idea to
+# rapidfuzz.token_sort_ratio)
+def token_sort_ratio(a, b):
+    if not a or not b:
+        return 0.0
+    ta = " ".join(sorted(clean_text(a).lower().split()))
+    tb = " ".join(sorted(clean_text(b).lower().split()))
+    return SequenceMatcher(None, ta, tb).ratio() * 100.0
+
+# PDF text extraction: try pdfplumber, then pypdf / PyPDF2
+def extract_text_from_pdf(pdf_path):
+    pdf_path = str(pdf_path)
+    try:
+        import pdfplumber
+        with pdfplumber.open(pdf_path) as pdf:
+            pages = [ (p.extract_text() or "") for p in pdf.pages ]
+        return "\n".join(pages)
+    except Exception:
+        pass
+    # try pypdf / PyPDF2 fallback
+    try:
+        try:
+            import pypdf
+            Reader = pypdf.PdfReader
+        except Exception:
+            from PyPDF2 import PdfReader as Reader
+        reader = Reader(pdf_path)
+        pages = []
+        for p in getattr(reader, "pages", []):
+            try:
+                pages.append(p.extract_text() or "")
+            except Exception:
+                pages.append("")
+        return "\n".join(pages)
+    except Exception as e:
+        raise RuntimeError("No PDF extractor available (install pdfplumber, pypdf or PyPDF2) : " + str(e))
+
+# --- Extraction routines (best-effort) ---
+def extract_uniformat(pdf_path):
+    if not pdf_path.exists():
+        return pd.DataFrame(columns=["UF Level","UF Code","UF Description"])
+    text = extract_text_from_pdf(pdf_path)
+    # pattern for codes like A1010 or B2010.10 etc.
+    pattern = re.compile(r'\b([A-Z]\d{3}(?:\.\d+(?:\.\d+)?)?)\b[ \t\-:]{0,3}([^\n\r]+)')
+    found = {}
+    for m in pattern.finditer(text):
+        code = m.group(1).strip()
+        desc = clean_text(m.group(2))
+        if len(desc) < 2: continue
+        if code not in found or len(desc) > len(found[code]):
+            found[code] = desc
+    rows = []
+    for code, desc in sorted(found.items()):
+        parts = code.split('.')
+        if len(parts) == 1:
+            level = "L2"
+        elif len(parts) == 2:
+            level = "L3"
+        else:
+            level = "L4"
+        rows.append({"UF Level": level, "UF Code": code, "UF Description": desc})
+    return pd.DataFrame(rows)
+
+def extract_masterformat(pdf_path):
+    if not pdf_path.exists():
+        return pd.DataFrame(columns=["MF Section","MF Description"])
+    text = extract_text_from_pdf(pdf_path)
+    pattern = re.compile(r'\b(\d{2}(?:\s\d{2}){2})\b[ \t\-:]{0,3}([^\n\r]+)')
+    seen = {}
+    for m in pattern.finditer(text):
+        code = m.group(1).replace('\u00A0',' ').strip()
+        desc = clean_text(m.group(2))
+        if len(desc) < 2: continue
+        if code not in seen or len(desc) > len(seen[code]):
+            seen[code] = desc
+    rows = [{"MF Section": k, "MF Description": v} for k, v in sorted(seen.items())]
+    return pd.DataFrame(rows)
+
+def read_omnitable(csv_path):
+    if not csv_path.exists():
+        return pd.DataFrame(columns=["OC Code","OC Title","OC Table"])
+    df = pd.read_csv(csv_path, dtype=str, encoding='utf-8', errors='ignore')
+    possible_code = [c for c in df.columns if re.search(r'code', c, re.I)]
+    possible_title = [c for c in df.columns if re.search(r'title|name|description', c, re.I)]
+    code_col = possible_code[0] if possible_code else df.columns[0]
+    title_col = possible_title[0] if possible_title else (df.columns[1] if len(df.columns)>1 else df.columns[0])
+    df = df.rename(columns={code_col: "OC Code", title_col: "OC Title"})[["OC Code","OC Title"]]
+    df["OC Code"] = df["OC Code"].astype(str).map(clean_text)
+    df["OC Title"] = df["OC Title"].astype(str).map(clean_text)
+    m = re.search(r'(\d{2})', csv_path.name)
+    df["OC Table"] = m.group(1) if m else ""
+    return df
+
+# --- Main: find or regenerate ---
+def generate_crosswalk(output_path):
+    oc_dfs = [read_omnitable(p) for p in OMNI_GLOB] if OMNI_GLOB else []
+    oc_all = pd.concat(oc_dfs, ignore_index=True) if oc_dfs else pd.DataFrame(columns=["OC Code","OC Title","OC Table"])
+    uf_df = extract_uniformat(UNIFORMAT_PDF) if UNIFORMAT_PDF.exists() else pd.DataFrame(columns=["UF Level","UF Code","UF Description"])
+    mf_df = extract_masterformat(MASTERFORMAT_PDF) if MASTERFORMAT_PDF.exists() else pd.DataFrame(columns=["MF Section","MF Description"])
+
+    mf_choices = mf_df["MF Description"].tolist() if not mf_df.empty else []
+    mf_keys = mf_df["MF Section"].tolist() if not mf_df.empty else []
+    mf_map = dict(zip(mf_keys, mf_choices))
+
+    oc_choices = (oc_all["OC Title"] + " | " + oc_all["OC Code"]).tolist() if not oc_all.empty else []
+    oc_map = {(r["OC Code"], r["OC Title"]): r["OC Table"] for _, r in oc_all.iterrows()} if not oc_all.empty else {}
+
+    rows = []
+    for _, uf in uf_df.iterrows():
+        uf_code = uf["UF Code"]
+        uf_desc = uf["UF Description"]
+        # MF best match
+        mf_section_code = ""
+        mf_score = 0
+        if mf_choices:
+            best_idx, best_score = None, -1
+            for i, cand in enumerate(mf_choices):
+                s = token_sort_ratio(uf_desc, cand)
+                if s > best_score:
+                    best_score, best_idx = s, i
+            if best_score >= 50:
+                mf_score = round(best_score,1)
+                mf_section_code = mf_keys[best_idx] if best_idx is not None else ""
+        # OC best match
+        oc_table = oc_code = oc_title = ""
+        oc_score = 0
+        if oc_choices:
+            best_idx, best_score = None, -1
+            for i, cand in enumerate(oc_choices):
+                s = token_sort_ratio(uf_desc, cand)
+                if s > best_score:
+                    best_score, best_idx = s, i
+            if best_score >= 50:
+                oc_score = round(best_score,1)
+                combined = oc_choices[best_idx]
+                if " | " in combined:
+                    title, code = combined.split(" | ", 1)
+                    oc_title, oc_code = title, code
+                    oc_table = oc_map.get((oc_code, oc_title), "")
+        level = uf.get("UF Level","")
+        relationship = "ELEMENTAL" if level == "L2" else "PRODUCT"
+        rows.append({
+            "UF Level": level,
+            "UF Code": uf_code,
+            "UF Description": uf_desc,
+            "MF Section": mf_section_code,
+            "MF Description": mf_map.get(mf_section_code,""),
+            "OC Table": oc_table,
+            "OC Code": oc_code,
+            "OC Title": oc_title,
+            "Relationship": relationship,
+            "MF Match Score": mf_score,
+            "OC Match Score": oc_score
+        })
+
+    out_df = pd.DataFrame(rows, columns=[
+        "UF Level","UF Code","UF Description",
+        "MF Section","MF Description",
+        "OC Table","OC Code","OC Title",
+        "Relationship","MF Match Score","OC Match Score"
+    ])
+
+    # Try Excel, else CSV fallback
+    try:
+        out_df.to_excel(output_path, index=False)
+        return output_path
+    except Exception as e:
+        fallback = output_path.with_suffix(".csv")
+        out_df.to_csv(fallback, index=False)
+        return fallback
+
+def main():
+    existing = find_existing_outputs()
+    if existing:
+        print("Found existing crosswalk file(s):")
+        for p in existing:
+            print(" -", p.resolve())
+        return
+    print("No existing crosswalk found. Regenerating...")
+    try:
+        out = generate_crosswalk(OUTPUT_PATH)
+        print("Generated crosswalk at:", out.resolve())
+    except Exception as e:
+        print("Failed to regenerate crosswalk:", e)
+        sys.exit(2)
+
+if __name__ == "__main__":
+    main()
